@@ -1,0 +1,10 @@
+.idea
+venv
+*.pyc
+experiments
+data/dynops
+data/tests
+data/logs
+data/dream4_10
+data/dream4_100
+site_info.json

@@ -1,0 +1,29 @@
+fc-feddypam:
+  input:
+    dataset_location: client.csv
+    test_dataset_location: test.csv
+    has_target: true
+    target: 'full_remission'
+    has_id_variable: true
+    id_variable: 'Chiffre'
+    has_time_variable: true
+    time_variable: 'Date'
+  split:
+    mode: 'file'
+    dir: '.'
+  max_iterations: 100
+  num_bootstrap_iterations: 100
+  alpha: 0.1
+  gamma: 0.15
+  homogeneous: true
+  testing: false
+  benchmark: child
+  threshold: 0.5
+  num_samples: null
+  num_jobs: 5
+  n_splits: 5
+  parameter_test: true
+  temporal:
+    dbn_order: 1
+    use_delay: true
+    target_is_current_slice: false
