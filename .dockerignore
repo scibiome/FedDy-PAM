@@ -2,3 +2,4 @@ venv
 .idea
 .gitignore
 .gitattributes
+__pycache__
