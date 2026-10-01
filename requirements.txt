@@ -13,3 +13,6 @@ scikit-learn
 seaborn
 scikit-image
 tqdm_joblib
+plotly
+dash
+dash_cytoscape

@@ -21,8 +21,11 @@ warnings.filterwarnings('ignore', category=UserWarning, module='pgmpy')
 warnings.filterwarnings('ignore', message='.*Replacing existing CPD.*')
 warnings.filterwarnings('ignore', message='.*pgmpy.*')
 
+import functools
+
 import client
 import server
+from store import store
 
 
 def _record_payload_size(state, payload):
@@ -55,7 +58,33 @@ CPT_LEARNING = 'cpt learning'
 CPT_AGGREGATION = 'aggregate cpts'
 AWAIT_CPT_AGGREGATION = 'await cpt aggregation'
 EVALUATION = 'evaluation'
+VISUALIZE = 'visualize'
 TERMINAL = 'terminal'
+
+# Dedicated memos so the finish handshake and the metric exchange never collide
+# with the GATHERROUND* traffic of an ordinary round.
+FINISH_SIGNAL = 'finish'
+FINISH_MEMO = 'FEDPAM_FINISH'
+EVAL_MEMO = 'FEDPAM_EVAL'
+
+
+def park_on_error(run_method):
+    """Never let a failing state tear the container down.
+
+    FeatureCloud's engine catches anything escaping a state, marks the run ERROR
+    and finishes -- killing the container and the dashboard with it. Wrapped
+    states publish the traceback to the UI and divert to VISUALIZE instead.
+    """
+    @functools.wraps(run_method)
+    def wrapper(self):
+        try:
+            return run_method(self)
+        except Exception:
+            tb = traceback.format_exc()
+            self.log(f"[ERROR] state failed, diverting to {VISUALIZE}:\n{tb}")
+            store.update(error=tb)
+            return VISUALIZE
+    return wrapper
 
 @app_state(name = INITIAL, role = Role.BOTH)
 class InitialState(AppState):
@@ -69,6 +98,9 @@ class InitialState(AppState):
     
     def run(self):
         self.log("Initializing FedPAM Application...")
+        store.update(is_coordinator=self.is_coordinator, client_id=self.id,
+                     current_state=INITIAL)
+        self.log(f"Role: {'coordinator' if self.is_coordinator else 'participant'}")
         self.log("Initial State to Fetch Data State")
         return FETCH_DATA
 
@@ -89,22 +121,28 @@ class FetchDataState(AppState):
         if not os.path.exists(config_file_path):
             raise FileNotFoundError(f"Config file not found at {config_file_path}.")
         
+        store.update(config_path=config_file_path)
         with open(config_file_path) as cfp:
             config_file = yaml.safe_load(cfp)
 
         configs = config_file['fc-feddypam']
         self.store('dataset_location', configs['input']['dataset_location'])
-        # Held-out per-client test file, expected in the SAME split folder as
-        # dataset_location (e.g. both 'client.csv' and 'test.csv' living side
-        # by side under each client's split directory). Defaults to
-        # 'test.csv' so existing config.yml files don't need to change.
         self.store('test_dataset_location', configs['input'].get('test_dataset_location', 'test.csv'))
         self.store('has_target', configs['input']['has_target'])
+        store.update(has_target=bool(configs['input']['has_target']),
+                     target=configs['input'].get('target')
+                     if configs['input']['has_target'] else None)
         self.store('target', configs['input']['target'])
         self.store('has_id_variable', configs['input'].get('has_id_variable', False))
         self.store('id_variable', configs['input'].get('id_variable', None))
         self.store('has_time_variable', configs['input'].get('has_time_variable', False))
         self.store('time_variable', configs['input'].get('time_variable', None))
+        # Publish the id/time column names to the UI (None when not configured).
+        store.update(
+            id_variable=configs['input'].get('id_variable')
+            if configs['input'].get('has_id_variable', False) else None,
+            time_variable=configs['input'].get('time_variable')
+            if configs['input'].get('has_time_variable', False) else None)
         self.store('split_mode', configs['split']['mode'])
         self.store('split_dir', configs['split']['dir'])
         
@@ -115,17 +153,13 @@ class FetchDataState(AppState):
         self.store('gamma', configs['gamma']) 
         self.store('homogeneous', configs['homogeneous']) 
         self.store('testing', configs['testing'])
+        store.update(testing_enabled=bool(configs['testing']),
+                     benchmark=configs.get('benchmark'))
         self.store('benchmark', configs['benchmark'])
         self.store('threshold', configs['threshold'])
         self.store('num_samples', configs['num_samples'])
         self.store('num_jobs', configs['num_jobs'])
-        self.store('n_splits', configs.get('n_splits', 5))
 
-        # Optional diagnostic: compares the multi-logit ("beta") parameter
-        # representation against classic tabular CPTs fit directly from
-        # data — parameter-count and predictive-performance differences,
-        # for both the local (per-client) and global (SMPC-aggregated)
-        # models. See CPTLearningState / CPTAggregationState / EvaluationState.
         parameter_test = configs.get('parameter_test', False)
         if parameter_test and not configs['input']['has_target']:
             raise ValueError(
@@ -136,15 +170,6 @@ class FetchDataState(AppState):
             )
         self.store('parameter_test', parameter_test)
 
-        # Temporal mode: 4 supported cases, selected via config.yml —
-        #   dbn_order=1, use_delay=false -> 2TBN
-        #   dbn_order=1, use_delay=true  -> 2TBN + delay (irregular time series)
-        #   dbn_order>1, use_delay=false -> higher-order DBN
-        #   dbn_order>1, use_delay=true  -> higher-order DBN + delay
-        # dbn_order is the number of past slices the dataset is expected to
-        # carry ('(tm1)'..'(tm<dbn_order>)'); use_delay toggles whether
-        # 'delay_*' columns in the dataset are attached as extra parents of
-        # the temporal variables they gate (see Client.add_delay_edges).
         temporal_configs = configs.get('temporal', {})
         dbn_order = temporal_configs.get('dbn_order', 1)
         use_delay = temporal_configs.get('use_delay', False)
@@ -156,15 +181,12 @@ class FetchDataState(AppState):
             )
 
         self.store('dbn_order', dbn_order)
+        store.update(dbn_order=dbn_order, use_delay=bool(use_delay))
         self.store('use_delay', use_delay)
         self.store('target_is_current_slice', target_is_current_slice)
 
         testing = configs['testing']
         if testing and use_delay:
-            # Benchmark ground-truth networks (get_example_model) have no
-            # notion of a delay variable, so SHD/precision/recall comparisons
-            # in the 'testing' path can't be run against a delay-augmented
-            # DAG. Fail fast instead of breaking later in FinalState.
             raise ValueError(
                 "config.yml has both 'testing: true' and 'temporal.use_delay: true'. "
                 "Benchmark-based testing is not supported together with delay "
@@ -323,10 +345,6 @@ class FetchDataState(AppState):
                 dataset = dataset.sample(frac=1, random_state=23).reset_index(drop=True)
 
             dataset = dataset.reset_index(drop=True)
-
-            # ID and time columns are never modeled variables: pull them out here
-            # so every downstream state (structure learning, PAM, parameter
-            # fitting) only ever sees feature/target columns.
             if has_id_variable:
                 if not id_variable:
                     raise ValueError(
@@ -383,6 +401,12 @@ class FetchDataState(AppState):
                 raise RuntimeError(f"No matching split directory for client ID {client_id}.")
 
         self.store('dataset', splits[client_split_path])
+        store.update(dataset=splits[client_split_path],
+                     dataset_path=client_split_path,
+                     dataset_csv_path=os.path.join(
+                         client_split_path, self.load('dataset_location')))
+        self.log(f"[viz] dataset published to UI: "
+                 f"{splits[client_split_path].shape}")
         self.store('test_dataset', test_splits[client_split_path])
         self.store('client_split_path', client_split_path)
         if has_id_variable:
@@ -444,7 +468,9 @@ class LocalLearningState(AppState):
 
         self.store('local_pam', local_edge_strengths)
         self.store('local_dag', local_dag)
-        self.store('first_local_dag', local_dag)  # never overwritten by LOCAL_REFINEMENT, unlike 'local_dag'
+        self.store('first_local_dag', local_dag)
+        store.update(local_structure=sorted(local_dag.edges()),
+                     first_local_structure=sorted(local_dag.edges()))  # never overwritten by LOCAL_REFINEMENT, unlike 'local_dag'
 
         if testing_flag:
             benchmark_network = get_example_model(benchmark)
@@ -688,6 +714,8 @@ class LocalRefinementState(AppState):
         )
         self.store('local_dag', local_dag)
         self.store('local_pam', local_pam)
+        store.update(local_structure=sorted(local_dag.edges()),
+                     iteration=self.load('iteration'))
         local_payload = {
             "client_data_size": dataset_size,
             "client_pam": local_pam
@@ -704,7 +732,7 @@ class LocalRefinementState(AppState):
 @app_state(name = FINAL, role = Role.BOTH)
 class FinalState(AppState):
     def register(self):
-        self.register_transition(target = TERMINAL, role = Role.BOTH)
+        self.register_transition(target = VISUALIZE, role = Role.BOTH)
         self.register_transition(target = CATEGORY_LEVELS, role = Role.COORDINATOR)
         self.register_transition(target = AWAIT_CATEGORY_LEVELS, role = Role.PARTICIPANT)
 
@@ -749,12 +777,6 @@ class FinalState(AppState):
             self.log(f"Local network SHD: {local_network_shd}")
             self.log(f"TPR: {len(true_edges_local) / len(benchmark_network.edges())}")
 
-        # Irregular-time-series modes (2TBN + delay / higher-order DBN +
-        # delay): attach 'delay_*' columns as extra parents of the temporal
-        # variables whose inter-slice edges they gate. Delay columns are
-        # never part of structure search itself (see Client.drop_delay_columns),
-        # only added here once the final structure is settled — they have no
-        # parents of their own, so this can never introduce a cycle.
         use_delay = self.load('use_delay')
         if use_delay:
             delay_columns = [c for c in dataset.columns if c.startswith('delay_')]
@@ -772,6 +794,7 @@ class FinalState(AppState):
             )
 
         self.store('final_dag', final_dag)
+        store.update(global_structure=sorted(final_dag.edges()))
 
         if has_target:
             participant = client.Client()
@@ -784,8 +807,9 @@ class FinalState(AppState):
             else:
                 return AWAIT_CATEGORY_LEVELS
         else:
-            self.log("Final to terminal state")
-            return TERMINAL
+            self.log("No target column: skipping parameter learning, "
+                     "going to the waiting state.")
+            return VISUALIZE
 
 
 @app_state(name = CATEGORY_LEVELS, role = Role.COORDINATOR)
@@ -848,13 +872,6 @@ class ParameterLearningState(AppState):
         self.store('node_order', node_order)
         self.store('local_positions', positions)
 
-        # Beta parameters are shared with the coordinator via FeatureCloud's
-        # built-in SMPC secure-aggregation, instead of a plaintext payload:
-        # the coordinator never sees any individual client's beta vector or
-        # exact dataset size, only the sum of every client's weighted
-        # contribution (see Client.pack_flat_vector_for_smpc /
-        # Server.unpack_smpc_aggregate for how the weighted average is
-        # still recovered from that sum).
         client_data_size = len(train_dataset)
         smpc_payload = participant.pack_flat_vector_for_smpc(flat_vector, client_data_size)
 
@@ -899,6 +916,9 @@ class ParameterAggregationState(AppState):
 
         global_params = coordinator.unflatten_betas(global_flat_vector, node_order, positions)
         self.store('global_params', global_params)
+        store.update(global_params=global_params,
+                     category_levels=self.load('category_levels'),
+                     columns=list(self.load('dataset').columns))
         self.log(f"Aggregated global params for {len(global_params)} nodes.")
 
         if self.load('parameter_test'):
@@ -924,6 +944,9 @@ class AwaitParametersAggregationState(AppState):
         global_params = participant.unflatten_betas(global_flat_vector, node_order, positions)
 
         self.store('global_params', global_params)
+        store.update(global_params=global_params,
+                     category_levels=self.load('category_levels'),
+                     columns=list(self.load('dataset').columns))
         self.log(f"Received global params for {len(global_params)} nodes.")
 
         if self.load('parameter_test'):
@@ -964,10 +987,6 @@ class CPTLearningState(AppState):
 
         self.store('cpt_positions', cpt_positions)
 
-        # Same SMPC weighted-average trick as the beta round: scale by this
-        # client's dataset size and append that size, so summing every
-        # client's packed vector (via SMPC ADD) yields exactly the
-        # size-weighted average CPT once divided by the total.
         client_data_size = len(train_dataset)
         smpc_payload = participant.pack_flat_vector_for_smpc(flat_cpt_vector, client_data_size)
 
@@ -1040,10 +1059,12 @@ class AwaitCPTAggregationState(AppState):
 @app_state(name = EVALUATION, role = Role.BOTH)
 class EvaluationState(AppState):
     def register(self):
-        self.register_transition(target = TERMINAL, role = Role.BOTH)
+        self.register_transition(target = VISUALIZE, role = Role.BOTH)
 
+    @park_on_error
     def run(self):
         self.log("Evaluation")
+        store.update(current_state=EVALUATION)
 
         target = self.load('target')
         category_levels = self.load('category_levels')
@@ -1120,38 +1141,67 @@ class EvaluationState(AppState):
 
         first_local_dag = self.load('first_local_dag')
         self.log(f"FIRST LOCAL DAG: {first_local_dag.edges()}")
-        first_local_metrics = evaluate(
-            first_local_dag, "(1) Initial local network (bootstrap DAG) + local params"
-        )
+        published = {}
+
+        def publish(ui_label, metrics):
+            """Hand one block to the dashboard as soon as it is ready.
+
+            The UI expects {mean, std}; a held-out test set yields one score per
+            metric rather than a spread across folds, so std stays empty.
+            """
+            if metrics:
+                published[ui_label] = {"mean": dict(metrics), "std": {}, "folds": []}
+                store.update(evaluation=dict(published))
+            return metrics
+
+        first_local_metrics = publish(
+            "(1) Initial local network + local params",
+            evaluate(first_local_dag,
+                     "(1) Initial local network (bootstrap DAG) + local params"))
 
         last_local_dag = self.load('local_dag')
         self.log(f"FINAL LOCAL DAG: {last_local_dag.edges()}")
-        last_local_metrics = evaluate(
-            last_local_dag, "(2) Final local network (refined local DAG) + local params"
-        )
+        last_local_metrics = publish(
+            "(2) Final local network + local params",
+            evaluate(last_local_dag,
+                     "(2) Final local network (refined local DAG) + local params"))
 
         final_dag = self.load('final_dag')
         self.log(f"FINAL GLOBAL DAG: {final_dag.edges()}")
-        final_global_metrics = evaluate(
-            final_dag, "(3) Final global network (final DAG) + local params"
-        )
+        final_global_metrics = publish(
+            "(3) Final global network + local params",
+            evaluate(final_dag,
+                     "(3) Final global network (final DAG) + local params"))
 
         global_params = self.load('global_params')
-        final_global_agg_metrics = evaluate_fixed_params(
-            global_params, "(4) Final global network (final DAG) + aggregated global params"
-        )
+        final_global_agg_metrics = publish(
+            "(4) Final global network + aggregated global params",
+            evaluate_fixed_params(
+                global_params,
+                "(4) Final global network (final DAG) + aggregated global params"))
+
+        # Every client sends its own metrics upstream; only the coordinator
+        # receives the set, so only its dashboard shows the cross-client view.
+        try:
+            self.send_data_to_coordinator(
+                {"client": self.id, "evaluation": published}, memo=EVAL_MEMO)
+            if self.is_coordinator:
+                collected = {}
+                for payload in self.gather_data(memo=EVAL_MEMO):
+                    if isinstance(payload, dict) and payload.get("client"):
+                        collected[payload["client"]] = payload["evaluation"]
+                store.update(all_evaluations=collected)
+                self.log(f"[EVALUATION] coordinator collected results from "
+                         f"{len(collected)} clients.")
+        except Exception:
+            self.log(f"[EVALUATION] could not share results across clients:\n"
+                     f"{traceback.format_exc()}")
 
         self.store('first_local_metrics', first_local_metrics)
         self.store('last_local_metrics', last_local_metrics)
         self.store('final_global_metrics', final_global_metrics)
         self.store('final_global_agg_metrics', final_global_agg_metrics)
 
-        # ---------------- parameter_test: multi-logit vs CPT ----------------
-        # Compares the multi-logit ("beta") parameter representation against
-        # classic tabular CPTs fit directly from data: parameter-count and
-        # predictive-performance differences, computed separately for the
-        # LOCAL model (this client's own refined local DAG + own data) and
-        # the GLOBAL model (final DAG + SMPC-aggregated across all clients).
         if self.load('parameter_test'):
             self.log("[PARAMETER_TEST] Comparing multi-logit parameters against CPTs fit from data")
 
@@ -1224,11 +1274,6 @@ class EvaluationState(AppState):
             }
             self.store('parameter_test_results', parameter_test_results)
 
-        # ---------------- Communication-cost summary ----------------
-        # Average, over every payload this node sent via
-        # send_data_to_coordinator / broadcast_data during the whole
-        # workflow (PAM rounds, category-level exchange, parameter
-        # aggregation), of the message size in bytes.
         payload_sizes = self.load('payload_sizes') or []
         coordinator = server.Server()
         avg_payload_size = coordinator.average_payload_size(payload_sizes)
@@ -1243,4 +1288,101 @@ class EvaluationState(AppState):
         else:
             self.log("[WORKFLOW SUMMARY] No payloads were tracked during this run.")
 
+        return VISUALIZE
+
+
+@app_state(name = VISUALIZE, role = Role.BOTH)
+class VisualizeState(AppState):
+    """
+    Holds the container open so results stay readable in the dashboard.
+
+    FeatureCloud tears the container down as soon as the app reaches 'terminal',
+    and only then collects /mnt/output, so results are written BEFORE this state
+    blocks. The coordinator alone decides when the run ends: it waits for its
+    Finish button, then broadcasts a sentinel every participant waits for.
+    Nothing here may raise -- an exception would reach the engine, flip the run
+    to ERROR and kill the dashboard.
+    """
+    def register(self):
+        self.register_transition(target = TERMINAL, role = Role.BOTH)
+
+    def write_results(self):
+        output_dir = '/mnt/output'
+        os.makedirs(output_dir, exist_ok=True)
+        metrics = {
+            'first_local': self.load('first_local_metrics'),
+            'last_local': self.load('last_local_metrics'),
+            'final_global': self.load('final_global_metrics'),
+            'final_global_aggregated': self.load('final_global_agg_metrics'),
+        }
+        with open(os.path.join(output_dir, 'metrics.json'), 'w') as fh:
+            json.dump(metrics, fh, indent=2, default=str)
+
+        final_dag = self.load('final_dag')
+        if final_dag is not None:
+            with open(os.path.join(output_dir, 'global_structure.json'), 'w') as fh:
+                json.dump([list(e) for e in final_dag.edges()], fh, indent=2)
+        local_dag = self.load('local_dag')
+        if local_dag is not None:
+            with open(os.path.join(output_dir, 'local_structure.json'), 'w') as fh:
+                json.dump([list(e) for e in local_dag.edges()], fh, indent=2)
+        self.log(f"[VISUALIZE] Results written to {output_dir}")
+
+    def wait_as_coordinator(self):
+        self.log("[VISUALIZE] Results ready. Holding the workflow open until "
+                 "Finish is clicked...")
+        waited = 0
+        while not store.finish_clicked:
+            time.sleep(1)
+            waited += 1
+            if waited % 60 == 0:
+                self.log(f"[VISUALIZE] still waiting for Finish ({waited}s)")
+        self.log("[VISUALIZE] Finish clicked. Telling participants to shut down.")
+        # send_to_self=False: this client is finishing anyway, and the engine
+        # drains data_outgoing before the container exits.
+        self.broadcast_data(FINISH_SIGNAL, send_to_self=False, memo=FINISH_MEMO)
+
+    def wait_as_participant(self):
+        self.log("[VISUALIZE] Results ready. Holding the workflow open until "
+                 "the coordinator ends it...")
+        while True:
+            try:
+                signal = self.await_data(memo=FINISH_MEMO)
+            except Exception:
+                self.log(f"[VISUALIZE] await_data failed, retrying in 5s:\n"
+                         f"{traceback.format_exc()}")
+                time.sleep(5)
+                continue
+            if signal == FINISH_SIGNAL:
+                self.log("[VISUALIZE] Coordinator ended the workflow.")
+                return
+            self.log(f"[VISUALIZE] ignoring unexpected payload: {signal!r}")
+
+    def run(self):
+        role = 'coordinator' if self.is_coordinator else 'participant'
+        prefix = os.getenv("PATH_PREFIX")
+        store.update(current_state=VISUALIZE)
+        self.log(f"[VISUALIZE] entered as {role}; PATH_PREFIX={prefix!r}; "
+                 f"evaluation blocks in UI="
+                 f"{len(store.evaluation) if store.evaluation else 0}")
+
+        try:
+            self.write_results()
+        except Exception:
+            self.log(f"[VISUALIZE] Could not write results:\n{traceback.format_exc()}")
+
+        try:
+            if self.is_coordinator:
+                self.wait_as_coordinator()
+            else:
+                self.wait_as_participant()
+        except Exception:
+            self.log(f"[VISUALIZE] wait failed:\n{traceback.format_exc()}")
+            store.update(error="The finish handshake failed. Results are still "
+                               "readable; stop the run from the FeatureCloud UI.")
+            while True:
+                time.sleep(5)
+
+        store.update(finish_signalled=True)
+        self.log("[VISUALIZE] -> terminal")
         return TERMINAL

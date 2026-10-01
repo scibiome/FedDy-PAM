@@ -12,7 +12,7 @@ fc-feddypam:
     mode: 'file'
     dir: '.'
   max_iterations: 100
-  num_bootstrap_iterations: 100
+  num_bootstrap_iterations: 2
   alpha: 0.1
   gamma: 0.15
   homogeneous: true
@@ -20,7 +20,7 @@ fc-feddypam:
   benchmark: child
   threshold: 0.5
   num_samples: null
-  num_jobs: 5
+  num_jobs: 3
   n_splits: 5
   parameter_test: true
   temporal:
