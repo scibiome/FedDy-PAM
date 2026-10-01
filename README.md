@@ -135,7 +135,7 @@ To test FedPAM on locally stored datasets and simulate the federated learning wo
 
 ```
 featurecloud test start --app-image featurecloud.ai/feddypam --client-dirs './dynops/clients_05/client_1,./dynops/
-clients_03/client_2,./dynops/clients_03/client_3' --generic-dir './generic'
+clients_05/client_2,./dynops/clients_05/client_3' --generic-dir './generic'
 ```
 
 <b>Important</b>: Keep the shared `config.yml` file in the `generic` directory.
