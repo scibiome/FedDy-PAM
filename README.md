@@ -1,5 +1,5 @@
 # FedDy-PAM 
-FedPAM is a federated framework for discrete Bayesian network learning using Probabilistic Adjacency Matrices (PAMs).
+FedDy-PAM is a federated framework for dynamic Bayesian network learning using Probabilistic Adjacency Matrices (PAMs).
 
 ### Datasets Used
 1. **[DyNOPS Time-Series Patient Dataset](https://www.tu-braunschweig.de/psychologie/psychotherapieambulanz/forschung/dynops):** 
